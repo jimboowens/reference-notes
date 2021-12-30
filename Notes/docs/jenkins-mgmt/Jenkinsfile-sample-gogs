@@ -1,0 +1,102 @@
+def scmVars
+
+String CLUSTER = 'cluster'
+String PROJECT = 'project'
+String ORGANIZATION='organization-name-here'
+String REPO="repo-name-here"
+
+String repoURL = 'https://git.' + ORGANIZATION + '.com/' + REPO + '/...'
+String webhookURL = 'https://' + ORGANIZATION + '.webhook.office.com/webhookb2/...'
+
+node {
+   properties([
+     buildDiscarder(
+        logRotator(
+            artifactDaysToKeepStr: '',
+            artifactNumToKeepStr: '',
+            daysToKeepStr: '',
+            numToKeepStr: '5'
+         )
+      ),
+      [
+         $class: 'ThrottleJobProperty',
+         categories: [],
+         limitOneJobWithMatchingParams: false,
+         maxConcurrentPerNode: 0,
+         maxConcurrentTotal: 1,
+         paramsToUseForLimit: '',
+         throttleEnabled: true,
+         throttleOption: 'project'
+      ],
+      pipelineTriggers([])])
+   stage('Preparation') {
+      branchLabel = env.BRANCH_NAME
+      println "Branch Label: ${branchLabel}"
+      scmVars = checkout([
+         $class: 'GitSCM',
+         branches: [
+            [name: "refs/heads/${branchLabel}"]
+         ],
+         browser: [$class: 'GogsGit', repoUrl: ''],
+         doGenerateSubmoduleConfigurations: false,
+         extensions: [
+            [ $class: 'CleanBeforeCheckout']
+         ],
+         submoduleCfg: [],
+         userRemoteConfigs: [
+            [credentialsId: 'jenkins-git', url: repoURL]
+            ]
+         ]
+      )
+      oc = tool 'OC 3.11'
+   }
+
+   withEnv(["PATH+OC=${oc}"]) {
+      stage ('Image Build via OSCP') {
+         openshift.withCLUSTER(CLUSTER) {
+            openshift.withProject(PROJECT) {
+               openshift.withCredentials('jenkins-')+REPO+'-'+CLUSTER {
+                  bc = openshift.selector("bc/" + REPO + "-${branchLabel}")
+                  if (bc.exists()) {
+                     timeout(5) {
+                        b = bc.startBuild('--from-dir=s2i')
+                        b.logs('--follow=true')
+                     }
+                   } else {
+                     println "Build configuration not found for " + REPO + "-${branchLabel}"
+                  }
+               }
+            }
+         }
+      }
+
+      stage ('Rollout Test Env ') {
+         openshift.withCLUSTER(CLUSTER) {
+            openshift.withProject(PROJECT) {
+               openshift.withCredentials('jenkins-'+REPO+'-'+CLUSTER) {
+                  dc = openshift.selector("dc/" + REPO + "-${branchLabel}")
+                  if (dc.exists()) {
+                     d = dc.rollout().latest()
+                  } else if (branchLabel.equals('master')) {
+                     dc = openshift.selector('dc/' + REPO + '-sys')
+                     d = dc.rollout().latest()
+                     commit_message = sh(
+                        script: "git log -1 --format=%B ${scmVars.GIT_COMMIT}", returnStdout: true
+                        ).trim()
+                     office365ConnectorSend (
+                        webhookUrl: "${webhookURL}",
+                        color: "${currentBuild.currentResult} == 'SUCCESS' ? '00ff00' : 'ff0000'",
+                        factDefinitions:[
+                          [ name:'Commit Message', template:"${commit_message}"],
+                          [ name:'Pipeline Duration', template:"${currentBuild.durationString - ' and counting'}"]
+                        ]
+                     )
+                  } else {
+                     println 'Deployment config not found.  Skipped Deployment Phase.'
+                  }
+               }
+            }
+         }
+      }
+   }
+}
